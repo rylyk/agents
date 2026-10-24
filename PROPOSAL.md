@@ -149,8 +149,44 @@ There's one coordinator (the dispatcher) and flat workers. Nobody talks to anybo
 | **B. Scheduled pull** | A scheduled task (e.g. weeknights at 1 a.m., or every few hours) takes the oldest unblocked `ready-for-agent` ticket, claims it, builds it and opens a PR. A second task with a **`pull_request.opened`** trigger (filter: head branch starts with `claude/`) runs the verifier. | Native to your plan. No infrastructure. Runs while you sleep. | Polling, not instant. Draws on your weekly usage. | **Phase 2** (recommended default) |
 | **C. GitHub Action** | `claude-code-action` fires on the issue being labeled `ready-for-agent`. | Instant, event-driven. | Needs a token or API key as a repo secret. Billed differently. | If B's latency hurts |
 | **D. Claude Code Projects** | The coordinator chat routes tickets to threads with shared memory. | Productized map-reduce-and-manage. Steerable from your phone. | Beta. Memory lives outside your repo. Burns usage fastest. | **Phase 4** experiment |
+| **E. Hermes Kanban** (Nous Research) | A board stored locally in SQLite. A dispatcher checks every 60s, claims tickets and spawns builder or reviewer workers in git worktrees. | The board, dispatcher, review step and loop limits are already built and handle the hard cases (see 2.3.1). | Not Claude Code. Needs a host you maintain. Claude usage bills to extra-usage credits or an API key. Encourages too many named agents. | Phase 2 alternative to B, if you accept hosting and separate billing |
 
 For whichever option you use, set a **concurrency cap** (start at 1–2 in-flight tickets) and a **nightly ticket budget**. You're at your weekly-limit warning today, so measure tokens per merged ticket before scaling.
+
+#### 2.3.1 Hermes Kanban: helps if kept minimal, bloat if used fully
+
+Hermes Kanban is an implementation of this proposal's board and dispatcher, not a competing design. Its docs describe it as a board where "every handoff is a row anyone can read and write," as opposed to "fragile in-process subagent swarms."
+
+**What it adds over option B:**
+
+| This proposal needs | Hermes Kanban provides |
+|---|---|
+| Dispatch without you | A dispatcher loop (default 60s) that claims tickets atomically, reclaims stale claims and recovers crashed workers |
+| One writer per ticket, isolated | A `worktree` workspace per task |
+| Verifier separate from builder | A built-in review step: `kanban_request_review` hands off to a reviewer, and `kanban_request_changes` sends work back to the original builder |
+| Escalation path | `kanban_block` with a reason (`needs_input`, `capability`, `transient`, `dependency`) that surfaces to a human |
+| Bounce and loop limits | `failure_limit` retry breaker (default 2), and tasks that keep re-blocking for the same reason go to triage |
+| Agents never mark their own work done | Completion is refused unless the PR's required GitHub checks have passed ("A commit or diff alone never automatically completes a task") |
+| Coordinator that can't write code | An orchestrator profile limited to board, gateway and memory tools |
+
+**Where it turns into bloat or works against this design:**
+1. **Named profiles, each with its own memory.** It invites a persona org chart (§1.1), and each profile's memory is private, so lessons fragment across agents. Use **at most three profiles**: orchestrator, builder, reviewer.
+2. **Self-written memory and self-improving skills.** Both write automatically, which conflicts with "one home per fact" (§3). Memory is capped at about 2,200 characters, which helps. Turn on **memory write approval** and keep decisions in repo ADRs, not in agent memory.
+3. **A second tracker.** Its SQLite board would duplicate GitHub Issues. Pick **one** place for work state. Specs, ADRs, glossary and code stay in the repo either way.
+4. **Leaves Claude Code.** You lose hooks, auto-mode safety checks, cloud sessions and scheduled tasks. Skills mostly carry over, since Hermes follows the agentskills.io format.
+5. **Hosting.** The dispatcher runs inside a long-running Hermes process, so you need a VPS with systemd linger and a GitHub login per profile. Its docs describe a single-host, trusted-local-user model, and workers run as your user account.
+6. **Billing.** Per its provider docs, Claude through Hermes uses Max **extra-usage credits** or an API key, not your Claude Code plan allowance.
+
+**If you choose it, the minimal setup:**
+- one board per project, bound to the repo
+- three profiles: orchestrator (board tools only), builder (Claude Code-equivalent tools plus `tdd`), reviewer (the verify rubric from §2.2 ③)
+- `worktree` workspaces
+- memory write approval on
+- required GitHub checks on the repo
+- `failure_limit: 2`
+- the board as the only place work status lives
+
+**Skip:** bot teams, messaging platforms, extra specialist profiles, unreviewed self-editing skills.
 
 ### 2.4 Where your "software shop" lives: a playbook, not a department
 
@@ -219,7 +255,8 @@ Each phase has an exit test. Don't advance until it passes.
 - **Exit:** at least 60% of tickets merge without you touching the code.
 
 ### Phase 2: automatic dispatch
-- Create two scheduled tasks: a **builder** (schedule trigger, claims one frontier ticket per run) and a **verifier** (`pull_request.opened` trigger, head branch `claude/*`).
+- Choose the dispatcher: **B** (scheduled tasks, stays on your Claude plan, nothing to host) or **E** (Hermes Kanban, more built in, but you host it and it bills separately). See §2.3.1.
+- With B, create two scheduled tasks: a **builder** (schedule trigger, claims one frontier ticket per run) and a **verifier** (`pull_request.opened` trigger, head branch `claude/*`). With E, use the minimal setup in §2.3.1.
 - Add labels `ready-for-agent`, `in-progress`, `needs-human`, `area:*`. Set the concurrency cap to 1 and raise it later.
 - **Exit:** a spec's tickets go from `ready-for-agent` to merge-ready PRs overnight, and the only thing you do is review the PRs.
 
@@ -258,6 +295,7 @@ Primary:
 - Cognition: [Multi-Agents: What's Actually Working](https://cognition.ai/blog/multi-agents-working)
 - Matt Pocock: [mattpocock/skills](https://github.com/mattpocock/skills), especially `implement-spec`, `wayfinder`, `triage`, `to-tickets`, `retro` and `handoff`
 - Andrej Karpathy: [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
+- Nous Research: [Hermes Kanban](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban), [Hermes memory](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory), [Hermes AI providers](https://hermes-agent.nousresearch.com/docs/integrations/providers)
 
 Secondary (treat specifics with caution):
 - [Boris Cherny's parallel workflow (NeuronFeed)](https://neuronfeed.com/news/anthropic-s-claude-code-creator-shares-parallel-agent-workflow-as-product-hits-1)
