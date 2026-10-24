@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Run Claude Code as one station of the pipeline, on the model config/models.env assigns to it.
+# Usage: bin/station <station> [claude args...]
+#   bin/station build                      interactive builder session
+#   bin/station verify -p "Review ..."     headless verifier run
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=../config/models.env
+source "${STATION_CONFIG:-$root/config/models.env}"
+
+station=${1:?usage: station <name> [claude args...]}
+shift
+var="STATION_$(tr 'a-z-' 'A-Z_' <<<"$station")"
+spec=${!var:-}
+[[ -n $spec ]] || { echo "station: $var is not set in config/models.env" >&2; exit 2; }
+backend=${spec%%:*}
+model=${spec#*:}
+
+case $backend in
+  claude)
+    unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_SUBAGENT_MODEL \
+      ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL
+    exec claude --model "$model" "$@"
+    ;;
+  ollama)
+    export ANTHROPIC_BASE_URL=$OLLAMA_URL ANTHROPIC_AUTH_TOKEN=ollama ANTHROPIC_API_KEY=""
+    # Point every alias at the local model so background and subagent calls never reach Claude.
+    export ANTHROPIC_DEFAULT_OPUS_MODEL=$model ANTHROPIC_DEFAULT_SONNET_MODEL=$model \
+      ANTHROPIC_DEFAULT_HAIKU_MODEL=$model ANTHROPIC_DEFAULT_FABLE_MODEL=$model CLAUDE_CODE_SUBAGENT_MODEL=$model
+
+    exec 9>"$GPU_LOCK"
+    if ! flock -n 9; then
+      echo "station: waiting for the GPU lock ($GPU_LOCK)" >&2
+      flock 9
+    fi
+    # Free the VRAM as soon as the session ends instead of after Ollama's keep-alive.
+    trap 'curl -fsS "$OLLAMA_URL/api/generate" -d "{\"model\":\"$model\",\"keep_alive\":0}" >/dev/null 2>&1 || true' EXIT
+    claude --model "$model" "$@"
+    ;;
+  *)
+    echo "station: unknown backend '$backend' in $var" >&2
+    exit 2
+    ;;
+esac

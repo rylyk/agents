@@ -14,4 +14,5 @@ A git mailbox between the **cloud session** (no access to the owner's PC) and th
 
 | # | Topic | Status |
 |---|---|---|
-| 001 | [Environment survey](001-environment-survey.md) | waiting for response |
+| 001 | [Environment survey](001-environment-survey.md) | answered ([response](001-environment-survey.response.md)) |
+| 002 | [Phase 0 bring-up on Ollama](002-phase0-bringup.md) | waiting for response |
