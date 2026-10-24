@@ -280,6 +280,21 @@ Each phase has an exit test. Don't advance until it passes.
 
 ---
 
+## 7. Status and next steps
+
+**Where things stand (2026-10-24):** proposal drafted, Hermes Kanban evaluated (§2.3.1). Nothing has been built yet. The open questions in §6 are still unanswered.
+
+1. **Answer §6**, above all which project to pilot. It should be real, small, and have tests or another clear way to verify the work.
+2. **Prepare the pilot repo:** run `/setup-matt-pocock-skills` with GitHub Issues as the tracker, make sure one command proves the app works (`make verify`, `npm test`), and install the Claude GitHub App.
+3. **Draft the playbook in this repo:** `playbooks/software/build.md`, `verify.md` and `ticket-template.md`, following §2.2. The verifier rubric matters most. Tailor them to the pilot's stack.
+4. **Shape one small spec live:** `grill-with-docs`, then `to-spec`, then `to-tickets`, aiming for 3–6 tickets. The owner approves the breakdown.
+5. **Run Phase 1 by hand:** a fresh session runs `implement-spec`, a separate clean-context session verifies, the owner merges. Record per ticket: merged without help, review bounces, `needs-human`, rough tokens.
+6. **Decide Phase 2 (B or E)** once at least 60% of tickets merge without intervention. If they don't, fix the ticket template and verifier first.
+
+Keep this section current as steps complete. It is the handoff point between sessions.
+
+---
+
 ## Sources
 
 Primary:
