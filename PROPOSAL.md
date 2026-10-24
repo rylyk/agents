@@ -75,6 +75,7 @@ I couldn't find public figures on Anthropic employees' per-person token use; I'd
 - **Scheduled tasks** (`/schedule`, claude.ai/code/routines) run Claude Code in the cloud on a cron schedule, an API call or a GitHub event, and push to `claude/`-prefixed branches. **GitHub triggers only support pull request and release events**, not issues. So "ticket labeled `ready-for-agent` → agent starts" needs either a polling schedule or a GitHub Action (`anthropics/claude-code-action` supports issue label triggers; confirm the setup in Phase 2).
 - Scheduled runs **draw from the same subscription usage** as interactive sessions. A green run status "does not mean the work your prompt describes succeeded," so read the transcript.
 - **Projects** threads also draw from your usage, and Anthropic warns they "can reach usage limits faster."
+- **Local models** (decided in §2.5): Claude Code can use a local model server through `ANTHROPIC_BASE_URL` (llama.cpp, Ollama and LM Studio now support Anthropic's API format). Cloud sessions and scheduled tasks can't reach a model on the owner's PC, so a local builder means a local dispatcher (§2.3, option F).
 
 ---
 
@@ -149,7 +150,8 @@ There's one coordinator (the dispatcher) and flat workers. Nobody talks to anybo
 | **B. Scheduled pull** | A scheduled task (e.g. weeknights at 1 a.m., or every few hours) takes the oldest unblocked `ready-for-agent` ticket, claims it, builds it and opens a PR. A second task with a **`pull_request.opened`** trigger (filter: head branch starts with `claude/`) runs the verifier. | Native to your plan. No infrastructure. Runs while you sleep. | Polling, not instant. Draws on your weekly usage. | **Phase 2** (recommended default) |
 | **C. GitHub Action** | `claude-code-action` fires on the issue being labeled `ready-for-agent`. | Instant, event-driven. | Needs a token or API key as a repo secret. Billed differently. | If B's latency hurts |
 | **D. Claude Code Projects** | The coordinator chat routes tickets to threads with shared memory. | Productized map-reduce-and-manage. Steerable from your phone. | Beta. Memory lives outside your repo. Burns usage fastest. | **Phase 4** experiment |
-| **E. Hermes Kanban** (Nous Research) | A board stored locally in SQLite. A dispatcher checks every 60s, claims tickets and spawns builder or reviewer workers in git worktrees. | The board, dispatcher, review step and loop limits are already built and handle the hard cases (see 2.3.1). | Not Claude Code. Needs a host you maintain. Claude usage bills to extra-usage credits or an API key. Encourages too many named agents. | Phase 2 alternative to B, if you accept hosting and separate billing |
+| **E. Hermes Kanban** (Nous Research) | A board stored locally in SQLite. A dispatcher checks every 60s, claims tickets and spawns builder or reviewer workers in git worktrees. | The board, dispatcher, review step and loop limits are already built and handle the hard cases (see 2.3.1). | Not Claude Code. Needs a host you maintain. Claude usage bills to extra-usage credits or an API key. Encourages too many named agents. | Phase 2 alternative to F |
+| **F. Local loop** | A script on the owner's PC, run by cron or Task Scheduler. It claims one frontier ticket, runs a headless builder session in a git worktree on the local model (§2.5), runs the deterministic gate, runs a headless Claude verifier, and applies the escalation ladder. | Stays in Claude Code, so it keeps the subscription, skills and hooks. Free builder tokens. Nothing to rent. | The PC must be on. Concurrency is 1, because there is one GPU. You maintain the script. | **Phase 2 (chosen, 2026-10-24)**, because the system runs locally and cloud scheduled tasks (B) can't reach a local model |
 
 For whichever option you use, set a **concurrency cap** (start at 1–2 in-flight tickets) and a **nightly ticket budget**. You're at your weekly-limit warning today, so measure tokens per merged ticket before scaling.
 
@@ -207,6 +209,41 @@ playbooks/
 
 **Routing** is just a label on the spec (`shop:software`, `shop:research`) that tells the dispatcher which playbook to load. Adding a new kind of shop means adding a folder, not a layer.
 
+### 2.5 Model allocation: local builder, Claude for judgment
+
+**Decision (2026-10-24):** the system runs locally on the owner's PC. The builder runs on a **local model**, and Claude models within the subscription handle shaping, verification and escalation. This applies "separate the doer from the grader" across models: the cheap model does the token-heavy work and a stronger model grades it.
+
+**Hardware:** RTX 3080 (10 GB VRAM), 32 GB RAM, Ryzen 9 5900X. The limit is VRAM plus RAM. Mixture-of-experts (MoE) models up to roughly 35–40B total parameters fit at 4-bit, with expert weights held in system RAM. Dense models above about 14B are too slow for agent loops.
+
+| Station | Default model | Why |
+|---|---|---|
+| ① Shape (grill → spec → tickets) | Claude Opus | The owner is live and ticket quality is where the leverage is |
+| Dispatcher | None (a script) | It picks and claims tickets; that needs no judgment |
+| ② Build | **Local: Qwen3.6-35B-A3B** (MoE, 3B active, Q4) | The token-heavy station. Tickets that clear the readiness bar are what a 30B-class model can handle |
+| Deterministic gate (new) | None | Tests, typecheck and lint run locally before any Claude review. A red build goes back to the builder at no subscription cost |
+| ③ Verify | Claude Sonnet; Opus for the spec-level review and `area:` labels on the autonomy line | The grader must be stronger than the doer. Reading a diff and a ticket costs far less than building |
+| Build escalation | Claude Sonnet, in a fresh session on the same ticket | Used before `needs-human` (see the ladder below) |
+| ⑤ Learn: transcript first pass, wiki embeddings | Local | Bulk extraction and similarity search |
+| ⑤ Learn: retro synthesis, wiki lint decisions | Claude Opus | Low volume, high judgment |
+| Small jobs (CI log condensing, progress comments, commit messages, labels) | Local, or Claude Haiku | Cheap either way |
+
+**Escalation ladder** (this replaces the ③ bounce limit when the builder is local): local builder, up to 2 bounces → a fresh Claude Sonnet builder session on the same ticket, up to 1 bounce → `needs-human`. The owner gets pulled in only after a stronger model has had a go.
+
+**Swappable by design.** Each station's model lives in **one config file** in this repo (for example `config/models.env`). Playbooks name stations, never models. Every station runs through Claude Code, so skills, hooks and the playbook stay the same whichever model is behind it:
+- **Local model:** `llama-server` serves an Anthropic-compatible API. The station runs `claude` with `ANTHROPIC_BASE_URL` pointing at it, and with the model aliases Claude Code uses for background calls mapped to the local model. Check the current Claude Code docs for the env var names.
+- **Claude model:** the station runs `claude --model sonnet` (or `opus`, `haiku`) on the subscription.
+- Moving the builder to Flint, a future Qwen model or Claude Sonnet is a one-line change.
+
+**Local runtime defaults** (tune in Phase 0):
+- llama.cpp CUDA build, running `llama-server` directly rather than through Ollama, for control over MoE offload
+- 4-bit GGUF (Unsloth `UD-Q4_K_XL` or `Q4_K_M`), with all layers on the GPU (`-ngl 99`) and expert weights in RAM (`-ncmoe N`), raising N until VRAM fits
+- 64k context, q8_0 KV cache, the `--jinja` chat template for tool calling, and one slot (concurrency 1)
+- Expected speed, from similar cards: roughly 30–45 tok/s generation. Measure with `llama-bench` at empty and at 32k context.
+
+**Watch for:** Vendor benchmark scores (73.4% SWE-bench Verified for Qwen3.6-35B-A3B) are measured at full precision on the vendor's own setup, so expect less at Q4 inside Claude Code. A weaker builder also means more bounces, so Claude re-reviews more diffs and Gate 2 needs more of the owner's attention. **If fewer than about half of local-built tickets merge without help, the savings are gone.** In that case move the builder to Sonnet and keep local models for ⑤ and small jobs.
+
+**Hardware upgrades:** 64 GB of RAM buys longer context and better quantizations, but no new class of model. The next class (Qwen3.8-Flash-Next, 125B-A6B) needs 96–128 GB. Don't buy anything before the Phase 1 data is in.
+
 ---
 
 ## 3. Memory: a "second brain" that doesn't rot
@@ -246,17 +283,24 @@ Rules that directly target "hung up on conclusions that are no longer valid":
 
 Each phase has an exit test. Don't advance until it passes.
 
+### Phase 0: local builder bring-up (an evening or two)
+- Install llama.cpp and Qwen3.6-35B-A3B with the defaults in §2.5. Tune `-ncmoe` and record generation and prompt-processing speed at empty and at 32k context.
+- Point Claude Code at `llama-server` and run a toy TDD task: read a file, write a failing test, make it pass. Watch for broken tool calls, and for background calls that still try to reach a Claude model.
+- Create `config/models.env` (§2.5) and a wrapper that starts a session for a given station.
+- **Exit:** at least ~25 tok/s generation at 32k context, and the toy task finishes with no malformed tool calls. If it doesn't, try Flint or a smaller quantization before moving on.
+
 ### Phase 1: single-lane loop, manual kick (about a week)
 - Pick **one real project**. Run `/setup-matt-pocock-skills` with GitHub Issues as the tracker.
-- Shape a small spec (3–6 tickets) with `grill-with-docs → to-spec → to-tickets`.
-- In a **fresh** cloud session, run `implement-spec`. Then run a separate, clean session for verification using the spec, standards and e2e rubric. Then you merge.
+- Shape a small spec (3–6 tickets) with `grill-with-docs → to-spec → to-tickets`, using Opus.
+- For each ticket, start a **fresh** local session with the builder station (one ticket per session rather than `implement-spec`, which leans on subagents and suits a stronger model). Then run the deterministic gate, then a separate, clean Claude session for verification using the spec, standards and e2e rubric. Then apply the escalation ladder (§2.5). Then you merge.
+- Run 1–2 tickets through a Sonnet builder as well, for comparison.
 - Write `playbooks/software/verify.md` from whatever the verifier missed.
-- **Track per ticket:** merged without your intervention (yes/no), number of bounces, `needs-human` count, rough tokens.
-- **Exit:** at least 60% of tickets merge without you touching the code.
+- **Track per ticket:** builder model, merged without your intervention (yes/no), number of bounces, escalated to Sonnet (yes/no), `needs-human` count, **Claude usage per merged ticket**, and local wall-clock time.
+- **Exit:** at least 60% of tickets merge without you touching the code, and Claude usage per merged ticket is clearly below the Sonnet-builder comparison.
 
 ### Phase 2: automatic dispatch
-- Choose the dispatcher: **B** (scheduled tasks, stays on your Claude plan, nothing to host) or **E** (Hermes Kanban, more built in, but you host it and it bills separately). See §2.3.1.
-- With B, create two scheduled tasks: a **builder** (schedule trigger, claims one frontier ticket per run) and a **verifier** (`pull_request.opened` trigger, head branch `claude/*`). With E, use the minimal setup in §2.3.1.
+- Choose the dispatcher: **F** (local loop, the default since the system runs locally) or **E** (Hermes Kanban, more built in, but it bills Claude separately). See §2.3 and §2.3.1.
+- With F, write the loop script: claim ticket → worktree → builder station → deterministic gate → verifier station → escalation ladder → PR or `needs-human`. Run it overnight from cron or Task Scheduler. With E, use the minimal setup in §2.3.1.
 - Add labels `ready-for-agent`, `in-progress`, `needs-human`, `area:*`. Set the concurrency cap to 1 and raise it later.
 - **Exit:** a spec's tickets go from `ready-for-agent` to merge-ready PRs overnight, and the only thing you do is review the PRs.
 
@@ -277,19 +321,23 @@ Each phase has an exit test. Don't advance until it passes.
 3. **Budget:** what share of your weekly usage are you willing to give to AFK runs? This sets the concurrency cap.
 4. **Non-software shops:** is research or writing a near-term need, or is software enough for now?
 5. **Autonomy line:** are there areas (auth, billing, migrations, infrastructure) that should always be `ready-for-human`?
+6. **Local OS:** Windows (native or WSL2) or Linux? This decides how llama.cpp is installed, how the loop script is written, and whether it runs from cron or Task Scheduler.
+
+**Decided (2026-10-24):** the system runs locally, with a local builder (Qwen3.6-35B-A3B) and Claude models in the subscription for shaping, verifying and escalation (§2.5). Dispatcher option F (§2.3).
 
 ---
 
 ## 7. Status and next steps
 
-**Where things stand (2026-10-24):** proposal drafted, Hermes Kanban evaluated (§2.3.1). Nothing has been built yet. The open questions in §6 are still unanswered.
+**Where things stand (2026-10-24):** proposal drafted, Hermes Kanban evaluated (§2.3.1), and model allocation decided (§2.5): the system runs locally, with a Qwen3.6-35B-A3B builder and Claude for shaping, verifying and escalation. Nothing has been built yet. §6 questions 1–6 are still open.
 
-1. **Answer §6**, above all which project to pilot. It should be real, small, and have tests or another clear way to verify the work.
-2. **Prepare the pilot repo:** run `/setup-matt-pocock-skills` with GitHub Issues as the tracker, make sure one command proves the app works (`make verify`, `npm test`), and install the Claude GitHub App.
-3. **Draft the playbook in this repo:** `playbooks/software/build.md`, `verify.md` and `ticket-template.md`, following §2.2. The verifier rubric matters most. Tailor them to the pilot's stack.
-4. **Shape one small spec live:** `grill-with-docs`, then `to-spec`, then `to-tickets`, aiming for 3–6 tickets. The owner approves the breakdown.
-5. **Run Phase 1 by hand:** a fresh session runs `implement-spec`, a separate clean-context session verifies, the owner merges. Record per ticket: merged without help, review bounces, `needs-human`, rough tokens.
-6. **Decide Phase 2 (B or E)** once at least 60% of tickets merge without intervention. If they don't, fix the ticket template and verifier first.
+1. **Answer §6**, above all which project to pilot and which OS the PC runs. The pilot should be real, small, and have tests or another clear way to verify the work.
+2. **Phase 0, local builder bring-up (§5):** llama.cpp plus Qwen3.6-35B-A3B, tune `-ncmoe`, point Claude Code at it, and pass the toy TDD task. Create `config/models.env` and the station wrapper in this repo.
+3. **Prepare the pilot repo:** run `/setup-matt-pocock-skills` with GitHub Issues as the tracker, and make sure one command proves the app works (`make verify`, `npm test`).
+4. **Draft the playbook in this repo:** `playbooks/software/build.md`, `verify.md` and `ticket-template.md`, following §2.2. Write `build.md` for the local model: short, explicit steps, and a hard stop condition. The verifier rubric still matters most. Tailor both to the pilot's stack.
+5. **Shape one small spec live** with Opus: `grill-with-docs`, then `to-spec`, then `to-tickets`, aiming for 3–6 tickets. The owner approves the breakdown.
+6. **Run Phase 1 by hand (§5):** local builder → deterministic gate → Claude verifier → escalation ladder → owner merges. Run 1–2 tickets with a Sonnet builder for comparison, and record the per-ticket metrics.
+7. **Write the Phase 2 local loop (option F)** once at least 60% of tickets merge without intervention. If they don't, fix the ticket template and verifier first. If the local builder is what fails, swap it in `config/models.env` before redesigning anything.
 
 Keep this section current as steps complete. It is the handoff point between sessions.
 
@@ -310,6 +358,7 @@ Primary:
 - Cognition: [Multi-Agents: What's Actually Working](https://cognition.ai/blog/multi-agents-working)
 - Matt Pocock: [mattpocock/skills](https://github.com/mattpocock/skills), especially `implement-spec`, `wayfinder`, `triage`, `to-tickets`, `retro` and `handoff`
 - Andrej Karpathy: [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
+- Qwen: [Qwen3.6-35B-A3B](https://qwen.ai/blog?id=qwen3.6-35b-a3b)
 - Nous Research: [Hermes Kanban](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban), [Hermes memory](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory), [Hermes AI providers](https://hermes-agent.nousresearch.com/docs/integrations/providers)
 
 Secondary (treat specifics with caution):
@@ -319,3 +368,7 @@ Secondary (treat specifics with caution):
 - [Steve Yegge: Gas Town from Clown Show to v1.0](https://steve-yegge.medium.com/gas-town-from-clown-show-to-v1-0-c239d9a407ec)
 - [Martin Fowler: Understanding spec-driven development (Kiro, spec-kit, Tessl)](https://www.martinfowler.com/articles/exploring-gen-ai/sdd-3-tools.html)
 - [Background AI coding agents in 2026 (DEV)](https://dev.to/alexcloudstar/background-ai-coding-agents-in-2026-when-to-delegate-work-to-async-agents-3g92)
+- [Gemma 4 26B A4B vs Qwen3.6-27B vs Qwen3.6-35B-A3B (gist)](https://gist.github.com/hungson175/61a805368649c225026a69adf2ad87e0)
+- [Recursive Flint local coding model (MarkTechPost)](https://www.marktechpost.com/2026/10/21/recursive-flint-local-coding-model/)
+- [Pairing Claude Code with local models (KDnuggets)](https://www.kdnuggets.com/pairing-claude-code-with-local-models)
+- [One flag tripled tokens/sec on an 8GB GPU: `-ncmoe` (Medium)](https://medium.com/coding-nexus/one-flag-tripled-my-tokens-per-second-on-an-8gb-gpu-238f55d1e3bd)
